@@ -1492,6 +1492,9 @@ class Projector(object):
         init_tock = time.perf_counter()
         log.debug(f"time elapsed after intializing volumes: {init_tock - init_tick}")
 
+        import time
+
+        start_test = time.perf_counter()
         self.seg_texobs = []
         self.seg_texarrs = []
         for vol_id, _vol in enumerate(self.volumes):
@@ -1507,6 +1510,9 @@ class Projector(object):
                 texobj, texarr = create_cuda_texture(seg)
                 self.seg_texobs.append(texobj)
                 self.seg_texarrs.append(texarr)
+        
+        end_test = time.perf_counter()
+        printf(f"Time to create segmentation textures: {end_test - start_test}")
 
         self.volumes_texobs_gpu = cp.array(
             [x.ptr for x in self.volumes_texobs], dtype=np.uint64
