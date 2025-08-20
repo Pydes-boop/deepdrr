@@ -140,6 +140,7 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
               const float step, // step size (TODO: in world)
               const int * __restrict__ priority, // volumes with smaller priority-ID have higher priority
                              // when determining which volume we are in
+              const int * __restrict__ volume_enabled, // array indicating which volumes are enabled (1) or disabled (0)
               const float * __restrict__ gVolumeEdgeMinPointX, // These give a bounding box in world-space around each volume.
               const float * __restrict__ gVolumeEdgeMinPointY, // These give a bounding box in world-space around each volume.
               const float * __restrict__ gVolumeEdgeMinPointZ, // These give a bounding box in world-space around each volume.
@@ -262,6 +263,12 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
     float rz_ijk[NUM_VOLUMES];
 
     for (int i = 0; i < NUM_VOLUMES; i++) {
+        // Skip disabled volumes
+        if (volume_enabled[i] == 0) {
+            do_trace[i] = 0;
+            continue;
+        }
+        
         // Homogeneous transform of a vector.
 # define OFFS 12 // TODO: fix bad style
         rx_ijk[i] = ijk_from_world[OFFS * i + 0] * rx + ijk_from_world[OFFS * i + 1] * ry +
@@ -383,16 +390,68 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
         sz_ijk_local[i] = sz_ijk[i];
     }
 
+    
+    int voxels[2][2][2];
+    float weights[2][2][2];
+    float previous_coordinates[3] = {-1, -1, -1};
     // trace (if doing the last segment separately, need to use num_steps - 1
     for (int t = 0; t < num_steps; t++) {
         for (int vol_id = 0; vol_id < NUM_VOLUMES; vol_id++) {
-            px[vol_id] = sx_ijk_local[vol_id] + alpha * rx_ijk[vol_id] - 0.5f;
-            py[vol_id] = sy_ijk_local[vol_id] + alpha * ry_ijk[vol_id] - 0.5f;
-            pz[vol_id] = sz_ijk_local[vol_id] + alpha * rz_ijk[vol_id] - 0.5f;
+            // we offset by -1.0f because we manually calculate the the trilinear filtering value in the surrounding area
+            // -0.5 offset for cuda texture and additional -0.5 offset to recenter for a standard grid
+            px[vol_id] = sx_ijk_local[vol_id] + alpha * rx_ijk[vol_id] - 1.0f;
+            py[vol_id] = sy_ijk_local[vol_id] + alpha * ry_ijk[vol_id] - 1.0f;
+            pz[vol_id] = sz_ijk_local[vol_id] + alpha * rz_ijk[vol_id] - 1.0f;
 
+            // Reset segmentation values
             for (int mat_id = 0; mat_id < NUM_MATERIALS; mat_id++) {
-                seg_at_alpha[vol_id][mat_id] = tex3D<float>(seg_texs[vol_id * NUM_MATERIALS + mat_id], px[vol_id], py[vol_id], pz[vol_id]);
-                // seg_at_alpha[vol_id][mat_id] = roundf(cubicTex3D<float>(seg_texs[vol_id * NUM_MATERIALS + mat_id], px[vol_id], py[vol_id], pz[vol_id]));
+                seg_at_alpha[vol_id][mat_id] = 0.0f;
+            }
+
+            float base_x = floorf(px[vol_id]);
+            float base_y = floorf(py[vol_id]);
+            float base_z = floorf(pz[vol_id]);
+            
+            // only fetch new voxel values if the coordinates have changed
+            if(base_x != previous_coordinates[0] ||
+                base_y != previous_coordinates[1] ||
+                base_z != previous_coordinates[2]) {
+
+                // fetch the 8 surrounding material ids for the current voxel coordinate
+                for (int dz = 0; dz <= 1; ++dz)
+                for (int dy = 0; dy <= 1; ++dy)
+                for (int dx = 0; dx <= 1; ++dx) {
+                    voxels[dx][dy][dz] = tex3D<int>(seg_texs[vol_id], (px[vol_id] + dx), (py[vol_id] + dy), (pz[vol_id] + dz));
+                }
+
+                // update previous coordinates
+                previous_coordinates[0] = base_x;
+                previous_coordinates[1] = base_y;
+                previous_coordinates[2] = base_z;
+            }
+        
+            // subtract floored value from voxel coordinate to translate to 0..1 4x4 grid
+            float fx = px[vol_id] - base_x;
+            float fy = py[vol_id] - base_y;
+            float fz = pz[vol_id] - base_z;
+            float fx_inv = 1.0f - fx;
+            float fy_inv = 1.0f - fy;
+            float fz_inv = 1.0f - fz;
+            
+            weights[0][0][0] = fx_inv * fy_inv * fz_inv;
+            weights[1][0][0] = fx     * fy_inv * fz_inv;
+            weights[0][1][0] = fx_inv * fy     * fz_inv;
+            weights[1][1][0] = fx     * fy     * fz_inv;
+            weights[0][0][1] = fx_inv * fy_inv * fz;
+            weights[1][0][1] = fx     * fy_inv * fz;
+            weights[0][1][1] = fx_inv * fy     * fz;
+            weights[1][1][1] = fx     * fy     * fz;
+
+            // sum the weights for each material id
+            for (int dz = 0; dz <= 1; ++dz)
+            for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                seg_at_alpha[vol_id][voxels[dx][dy][dz]] += weights[dx][dy][dz];
             }
         }
 
@@ -400,6 +459,11 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
         n_vols_at_curr_priority = 0;
         for (int i = 0; i < NUM_VOLUMES; i++) {
             if (0 == do_trace[i]) {
+                continue;
+            }
+            
+            // Skip disabled volumes
+            if (volume_enabled[i] == 0) {
                 continue;
             }
 
@@ -474,8 +538,8 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
 
                 // Loop through volumes and add to the area_density.
                 for (int vol_id = 0; vol_id < NUM_VOLUMES; vol_id++) {
-                    if (do_trace[vol_id] && (priority_local[vol_id] == curr_priority)) {
-                        float vol_density = tex3D<float>(volume_texs[vol_id], px[vol_id], py[vol_id], pz[vol_id]);
+                    if (do_trace[vol_id] && (priority_local[vol_id] == curr_priority) && (volume_enabled[vol_id] == 1)) {
+                        float vol_density = tex3D<float>(volume_texs[vol_id], px[vol_id] + 0.5f, py[vol_id] + 0.5f, pz[vol_id] + 0.5f);
                         for (int mat_id = 0; mat_id < NUM_MATERIALS; mat_id++) {
                             area_density[mat_id] +=
                                 (weight)*vol_density *

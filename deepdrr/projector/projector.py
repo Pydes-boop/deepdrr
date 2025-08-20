@@ -189,7 +189,7 @@ def create_cuda_texture(
     format_descriptor = cupy.cuda.texture.ChannelFormatDescriptor(
         *channels, channel_type
     )
-
+    
     cuda_array = cupy.cuda.texture.CUDAarray(format_descriptor, *(texture_shape[::-1]))
     ressource_descriptor = cupy.cuda.texture.ResourceDescriptor(
         cupy.cuda.runtime.cudaResourceTypeArray, cuArr=cuda_array
@@ -546,7 +546,7 @@ class Projector(object):
 
         all_mats = []
         for _vol in self.volumes:
-            all_mats.extend(list(_vol.materials.keys()))
+            all_mats.extend(list(_vol.materials[0].keys()))
 
         for _vol in self.primitives:
             all_mats.append(_vol.material.drrMatName)
@@ -670,6 +670,10 @@ class Projector(object):
 
         camera_projections = self._prepare_project(camera_projections)
 
+        # check for enabled/disabled volumes
+        for vol_id, _vol in enumerate(self.volumes):
+            self.volume_enabled_gpu[vol_id] = 1 if _vol.enabled else 0
+
         intensities = []
         photon_probs = []
         for i, proj in enumerate(camera_projections):
@@ -718,6 +722,7 @@ class Projector(object):
             np.int32(proj.sensor_height),  # out_height
             np.float32(self.step),  # step
             np.uint64(self.priorities_gpu.data.ptr),  # priority
+            np.uint64(self.volume_enabled_gpu.data.ptr),  # volume_enabled
             np.uint64(self.minPointX_gpu.data.ptr),  # gVolumeEdgeMinPointX
             np.uint64(self.minPointY_gpu.data.ptr),  # gVolumeEdgeMinPointY
             np.uint64(self.minPointZ_gpu.data.ptr),  # gVolumeEdgeMinPointZ
@@ -956,16 +961,12 @@ class Projector(object):
             raise NotImplementedError("multiple projections")
 
         camera_projections = self._prepare_project(camera_projections)
-        log.info(type(camera_projections))
-        log.info(camera_projections)
         return self._render_seg(camera_projections[0], tags=tags)
 
     def _render_seg(
         self, proj: geo.CameraProjection, tags: Optional[List[str]] = None
     ) -> np.ndarray:
         zfar = self._setup_pyrender_scene(proj)
-        log.info(zfar)
-        log.info(proj)
         res = self._render_mesh_seg(proj, zfar, tags=tags)
         return res
 
@@ -1445,36 +1446,53 @@ class Projector(object):
         self.kernel_tide = self.peel_postprocess_mod.get_function("kernelTide")
         self.kernel_reorder = self.peel_postprocess_mod.get_function("kernelReorder")
         self.kernel_reorder2 = self.peel_postprocess_mod.get_function("kernelReorder2")
+        
+        log.info(f"Used: {cp.get_default_memory_pool().used_bytes() / (1024**2):.2f} MB Total: {cp.get_default_memory_pool().total_bytes() / (1024**2):.2f}")
 
         self.volumes_texobs = []
         self.volumes_texarrs = []
         for vol_id, volume in enumerate(self.volumes):
-            volume = np.array(volume)
-            volume = np.moveaxis(volume, [0, 1, 2], [2, 1, 0]).copy()
-            vol_texobj, vol_texarr = create_cuda_texture(volume)
-
+            volume_gpu = cp.asarray(volume)  # Move volume to GPU
+            volume_gpu = cp.moveaxis(volume_gpu, [0, 1, 2], [2, 1, 0])  # Adjust axes on GPU
+            volume = cp.asnumpy(volume_gpu)  # Move volume back to CPU for texture creation
+            log.info(np.shape(volume))
+            volume_gpu = None  # Free GPU memory
+            vol_texobj, vol_texarr = create_cuda_texture(volume)  # Create texture
             self.volumes_texarrs.append(vol_texarr)
             self.volumes_texobs.append(vol_texobj)
 
-        init_tock = time.perf_counter()
-        log.debug(f"time elapsed after intializing volumes: {init_tock - init_tick}")
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        log.info(f"Used: {cp.get_default_memory_pool().used_bytes() / (1024**2):.2f} MB Total: {cp.get_default_memory_pool().total_bytes() / (1024**2):.2f}")
 
         self.seg_texobs = []
         self.seg_texarrs = []
         for vol_id, _vol in enumerate(self.volumes):
-            for mat_id, mat in enumerate(self.all_materials):
-                seg = None
-                if mat in _vol.materials:
-                    seg = _vol.materials[mat]
-                else:
-                    seg = np.zeros(_vol.shape).astype(
-                        np.float32
-                    )  # TODO (liam): 8 bit textures to save VRAM?
-                seg = np.moveaxis(seg, [0, 1, 2], [2, 1, 0]).copy()
-                texobj, texarr = create_cuda_texture(seg)
-                self.seg_texobs.append(texobj)
-                self.seg_texarrs.append(texarr)
+            # Remap segmentation indices using cupy
+            label_list = []
+            for k in _vol.materials[0]:
+                if k in self.all_materials:
+                    label_list.append(self.all_materials.index(k))
+            label_dict_index_remapping = cp.array(label_list, dtype=cp.uint16)
+            # Perform remapping and axis adjustment on GPU
+            segmentation_gpu = cp.asarray(_vol.materials[1])
+            segmentation_gpu = label_dict_index_remapping[segmentation_gpu]
+            segmentation_gpu = cp.moveaxis(segmentation_gpu.astype(cp.uint8), [0, 1, 2], [2, 1, 0])
 
+            segmentation = cp.asnumpy(segmentation_gpu)  # Move segmentation to CPU for texture creation
+            segmentation_gpu = None # Free GPU memory
+
+            # Create CUDA texture
+            combined_texobj, combined_texarr = create_cuda_texture(
+                segmentation, sampling_mode="nearest", dtype=np.uint8
+            )
+            self.seg_texobs.append(combined_texobj)
+            self.seg_texarrs.append(combined_texarr)
+
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        log.info(f"Used: {cp.get_default_memory_pool().used_bytes() / (1024**2):.2f} MB Total: {cp.get_default_memory_pool().total_bytes() / (1024**2):.2f}")
+        
         self.volumes_texobs_gpu = cp.array(
             [x.ptr for x in self.volumes_texobs], dtype=np.uint64
         )
@@ -1543,6 +1561,9 @@ class Projector(object):
         self.priorities_gpu = cp.zeros(len(self.volumes), dtype=np.int32)
         for vol_id, prio in enumerate(self.priorities):
             self.priorities_gpu[vol_id] = prio
+
+        # allocate volume enabled flags on the GPU (all enabled by default)
+        self.volume_enabled_gpu = cp.ones(len(self.volumes), dtype=np.int32)
 
         # allocate gVolumeEdge{Min,Max}Point{X,Y,Z} and gVoxelElementSize{X,Y,Z} on the GPU
         self.minPointX_gpu = cp.zeros(len(self.volumes), dtype=np.float32)
@@ -1642,6 +1663,10 @@ class Projector(object):
         log.debug(
             f"time elapsed after intializing rest of stuff: {init_tock - init_tick}"
         )
+        
+        # Free unused GPU memory blocks by cupy
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
 
         # Mark self as initialized.
         self.initialized = True
@@ -1664,6 +1689,7 @@ class Projector(object):
             self.prim_unique_materials_gpu = None
 
             self.priorities_gpu = None
+            self.volume_enabled_gpu = None
             self.minPointX_gpu = None
             self.minPointY_gpu = None
             self.minPointZ_gpu = None
